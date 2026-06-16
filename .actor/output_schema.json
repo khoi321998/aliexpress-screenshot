@@ -1,0 +1,17 @@
+{
+    "$schema": "https://apify.com/schemas/v1/output.ide.json",
+    "actorOutputSchemaVersion": 1,
+    "title": "Output schema",
+    "properties": {
+        "dataset": {
+            "type": "string",
+            "title": "Dataset",
+            "template": "{{links.apiDefaultDatasetUrl}}/items"
+        },
+        "screenshots": {
+            "type": "string",
+            "title": "Screenshots",
+            "template": "{{links.apiDefaultKeyValueStoreUrl}}/keys"
+        }
+    }
+}

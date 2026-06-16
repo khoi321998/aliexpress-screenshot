@@ -1,0 +1,13 @@
+{
+    "actorKeyValueStoreSchemaVersion": 1,
+    "title": "Key-Value Store Schema",
+    "description": "Stores the captured page screenshots.",
+    "collections": {
+        "screenshots": {
+            "title": "Screenshots",
+            "description": "PNG/JPEG screenshots of the captured AliExpress pages.",
+            "keyPrefix": "screenshot",
+            "contentTypes": ["image/png", "image/jpeg"]
+        }
+    }
+}

@@ -1,0 +1,66 @@
+{
+    "$schema": "https://apify.com/schemas/v1/input.ide.json",
+    "title": "AliExpress Screenshot Actor",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "startUrls": {
+            "title": "Start URLs",
+            "type": "array",
+            "description": "AliExpress product (/item/) or seller (/store/) page URLs to screenshot.",
+            "editor": "requestListSources",
+            "prefill": [{ "url": "https://www.aliexpress.com/item/1005006344542164.html" }]
+        },
+        "mode": {
+            "title": "Mode",
+            "type": "string",
+            "editor": "select",
+            "default": "product",
+            "enum": ["product", "seller"],
+            "enumTitles": [
+                "Product (US residential proxy + fingerprint, rotate on block)",
+                "Seller (real IP, no fingerprint, solve captcha via 2captcha)"
+            ],
+            "description": "Which browser strategy to use. Product mode avoids and rotates on blocks; seller mode solves captchas in place via 2captcha."
+        },
+        "format": {
+            "title": "Screenshot Format",
+            "type": "string",
+            "editor": "select",
+            "default": "png",
+            "enum": ["png", "jpeg"],
+            "enumTitles": ["PNG", "JPEG (quality 85)"],
+            "description": "Output image format. JPEG is captured at quality 85."
+        },
+        "fullPage": {
+            "title": "Full Page Screenshot",
+            "type": "boolean",
+            "default": true,
+            "description": "Capture the entire scrollable page (lazy-loads images first) instead of just the viewport."
+        },
+        "viewportWidth": {
+            "title": "Viewport Width",
+            "type": "integer",
+            "default": 1920,
+            "minimum": 320,
+            "maximum": 3840,
+            "description": "Browser viewport width in pixels."
+        },
+        "viewportHeight": {
+            "title": "Viewport Height",
+            "type": "integer",
+            "default": 1080,
+            "minimum": 320,
+            "maximum": 2160,
+            "description": "Browser viewport height in pixels."
+        },
+        "twoCaptchaApiKey": {
+            "title": "2captcha API Key",
+            "type": "string",
+            "editor": "textfield",
+            "isSecret": true,
+            "description": "Seller mode only. Falls back to TWOCAPTCHA_API_KEY env var."
+        }
+    },
+    "required": ["startUrls"]
+}
