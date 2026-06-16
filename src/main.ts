@@ -249,6 +249,25 @@ async function buildProductCrawler(): Promise<PlaywrightCrawler> {
 // SELLER MODE — real IP, no fingerprint, solve captcha via 2captcha (never rotate)
 // =================================================================================================
 
+/**
+ * AliExpress overlays a "Register by passkey" login drawer (`.cosmos-drawer`) on store pages.
+ * It covers the right side of the viewport and ruins the screenshot, so dismiss it before capture.
+ * Best-effort: if no drawer rendered, the close button never appears and we just move on. Falls
+ * back to pressing Escape if the close button can't be clicked.
+ */
+async function dismissLoginDrawer(page: Page, ctxLog: PlaywrightCrawlingContext['log']): Promise<void> {
+    const closeButton = page.locator('.cosmos-drawer-close, .dialog-close-icon').first();
+    try {
+        await closeButton.waitFor({ state: 'visible', timeout: 5_000 });
+        await closeButton.click({ timeout: 5_000 });
+        await page.waitForTimeout(500);
+        ctxLog.info('Closed login drawer popup.');
+    } catch {
+        // No drawer (or it ignored the click) — try Escape, then carry on regardless.
+        await page.keyboard.press('Escape').catch(() => undefined);
+    }
+}
+
 async function buildSellerCrawler(): Promise<PlaywrightCrawler> {
     const apiKey = input.twoCaptchaApiKey || process.env.TWOCAPTCHA_API_KEY || undefined;
     const localeCookieValue = `site=glo&c_tp=${CURRENCY}&region=${PROXY_COUNTRY}&b_locale=${LANGUAGE}&ae_u_p_s=2`;
@@ -303,6 +322,10 @@ async function buildSellerCrawler(): Promise<PlaywrightCrawler> {
                     url: request.url,
                 });
             }
+
+            // Dismiss the login/register drawer that AliExpress overlays on store pages so it
+            // doesn't cover the screenshot.
+            await dismissLoginDrawer(page, ctxLog);
 
             // No extra readiness gate here: store anchors use `data-href` and the header class is
             // build-hashed, so a selector wait would just hang to its timeout. The page is already

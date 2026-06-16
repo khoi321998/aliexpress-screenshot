@@ -81,5 +81,6 @@ export async function captureAndSave(page: Page, url: string, opts: CaptureOptio
     const screenshotUrl = `${publicUrl}${publicUrl.includes('?') ? '&' : '?'}disableRedirect=true`;
 
     log.info('Screenshot captured.', { url, key });
+    log.info(`Screenshot URL: ${screenshotUrl}`);
     await Actor.pushData({ url, screenshotUrl });
 }
