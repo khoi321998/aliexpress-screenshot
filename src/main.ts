@@ -19,7 +19,7 @@ import { PlaywrightCrawler, type PlaywrightCrawlingContext } from '@crawlee/play
 import { Actor, log } from 'apify';
 import type { Page } from 'playwright';
 
-import { classifyPage, TITLE_SELECTORS } from './detection.js';
+import { CHALLENGE_SELECTORS, classifyPage, TITLE_SELECTORS } from './detection.js';
 import { logEgressIp } from './ip.js';
 import { captureAndSave, type CaptureOptions } from './screenshot.js';
 import { passCaptcha } from './sellerCaptcha.js';
@@ -41,7 +41,7 @@ const CURRENCY = 'USD';
 const LANGUAGE = 'en_US';
 const MAX_CONCURRENCY = 2;
 const MAX_REQUESTS_PER_CRAWL = 10;
-const MAX_REQUEST_RETRIES = 5;
+const MAX_REQUEST_RETRIES = 10;
 const HEADLESS = true;
 const WAIT_MS = 3_000;
 
@@ -228,18 +228,30 @@ async function buildProductCrawler(): Promise<PlaywrightCrawler> {
             let status = await classifyPage(page);
             if (status === 'captcha' || status === 'punish' || status === 'blocked') rotateAndRetry(ctx, status);
 
-            // 2. Wait for real product markup + a short hydration settle (never networkidle).
-            await page.waitForSelector(TITLE_SELECTORS.join(', '), { timeout: 30_000 }).catch(() => undefined);
+            // 2. Race the product title against any challenge selector: AliExpress injects the
+            //    slider/reCAPTCHA a few seconds AFTER domcontentloaded, so blindly waiting out the
+            //    title timeout would burn ~30s per challenged page. Whichever appears first wins.
+            await Promise.race([
+                page.waitForSelector(TITLE_SELECTORS.join(', '), { timeout: 30_000 }).catch(() => null),
+                page.waitForSelector(CHALLENGE_SELECTORS.join(', '), { timeout: 30_000 }).catch(() => null),
+            ]);
+
+            // 3. Re-classify immediately and rotate on any block BEFORE spending time on the hydration
+            //    settle below — no point waiting on a page we're about to discard.
+            status = await classifyPage(page);
+            if (status === 'captcha' || status === 'punish' || status === 'blocked') rotateAndRetry(ctx, status);
+
+            // 4. Short hydration settle (never networkidle).
             await page.waitForTimeout(1_500 + Math.random() * 1_500);
 
-            // 3. A late challenge can appear AFTER hydration — re-classify once before trusting the page.
-            //    `empty` after a full load is a soft block; rotate it like a hard one.
+            // 5. A late challenge can still appear AFTER hydration — final re-classify before trusting
+            //    the page. `empty` after a full load is a soft block; rotate it like a hard one.
             status = await classifyPage(page);
             if (status !== 'ok') rotateAndRetry(ctx, status);
 
             await logEgressIp(page, ctxLog, 'product'); // expect a proxy IP here
 
-            // 4. Lazy-load scroll (if fullPage) → waitMs → screenshot → KV save → pushData.
+            // 6. Lazy-load scroll (if fullPage) → waitMs → screenshot → KV save → pushData.
             await captureAndSave(page, request.url, captureOptions, ctxLog);
         },
     });

@@ -20,7 +20,17 @@ export const SLIDER_SELECTORS = [
     'iframe[src*="x5sec"]',
     'iframe[src*="punish"]',
 ];
-const CLOUDFLARE_SELECTORS = ['#cf-challenge-running', '#challenge-form', 'iframe[src*="challenges.cloudflare.com"]'];
+export const CLOUDFLARE_SELECTORS = [
+    '#cf-challenge-running',
+    '#challenge-form',
+    'iframe[src*="challenges.cloudflare.com"]',
+];
+
+// Union of all DOM-based challenge selectors (reCAPTCHA + Alibaba slider + Cloudflare). Used to race
+// against the product-title selector so a late-injected challenge is detected the instant it appears,
+// instead of waiting out the full title timeout. NOTE: "punish" is URL-based, not DOM-based, so it is
+// intentionally excluded here — `classifyPage` still catches it via `isPunishUrl`.
+export const CHALLENGE_SELECTORS = [...RECAPTCHA_SELECTORS, ...SLIDER_SELECTORS, ...CLOUDFLARE_SELECTORS];
 
 async function anySelectorPresent(page: Page, sels: string[]): Promise<boolean> {
     for (const s of sels) {
