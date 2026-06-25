@@ -63,10 +63,12 @@ export async function findRecaptchaSitekey(page: Page): Promise<string | null> {
             const match = frame.url().match(/[?&]k=([^&]+)/);
             if (match) return decodeURIComponent(match[1]);
         }
+        // A short timeout is essential: getAttribute auto-waits for the element, and the default
+        // 30s timeout × 12 attempts (360s) would overrun the Actor's 300s run timeout and hang.
         const dataKey = await page
             .locator('[data-sitekey]')
             .first()
-            .getAttribute('data-sitekey')
+            .getAttribute('data-sitekey', { timeout: 1_000 })
             .catch(() => null);
         if (dataKey) return dataKey;
         await page.waitForTimeout(1_000);
