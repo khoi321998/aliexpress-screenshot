@@ -18,10 +18,10 @@
             "default": "product",
             "enum": ["product", "seller"],
             "enumTitles": [
-                "Product (US residential proxy + fingerprint, rotate on block)",
+                "Product (US datacenter proxy + fingerprint, MTOP token gate, fast rotate on block)",
                 "Seller (real IP, no fingerprint, solve captcha via 2captcha)"
             ],
-            "description": "Which browser strategy to use. Product mode avoids and rotates on blocks; seller mode solves captchas in place via 2captcha."
+            "description": "Which browser strategy to use. Product mode validates the session with the signed MTOP token before rendering, so blocked sessions rotate in seconds; seller mode solves captchas in place via 2captcha."
         },
         "format": {
             "title": "Screenshot Format",
@@ -53,6 +53,12 @@
             "minimum": 320,
             "maximum": 2160,
             "description": "Browser viewport height in pixels."
+        },
+        "headless": {
+            "title": "Headless Browser",
+            "type": "boolean",
+            "default": true,
+            "description": "Local debugging only. Set false to watch the browser drive the page. Always leave true on the platform."
         },
         "twoCaptchaApiKey": {
             "title": "2captcha API Key",

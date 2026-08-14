@@ -5,9 +5,13 @@
  * stores it as a signed key-value-store PNG/JPEG. Output per request: `{ url, screenshotUrl }`.
  *
  * Two browser modes (see `mode` input):
- *  - `product`: US residential proxy + fingerprint injector. AVOIDANCE + ROTATION only — a
- *    captcha/punish/blocked/empty page burns the session, so we retire it and throw, letting
- *    Crawlee retry on a fresh sticky IP + fresh fingerprint. NEVER solves captchas here.
+ *  - `product`: Apify datacenter proxy + fingerprint injector, driven by a TOKEN-FIRST flow
+ *    (see `productApi.ts`). Pass 1 is a cheap bootstrap navigation that only warms the anti-bot
+ *    cookies; we then probe the session with the signed MTOP `pdp.pc.query` call. A bad session is
+ *    detected in seconds — we retire it and throw so Crawlee retries on a fresh IP + fingerprint,
+ *    with no time wasted rendering a page that was never going to work. Only once the token proves
+ *    valid does pass 2 reload the page for real (assets unblocked) and screenshot it. NEVER solves
+ *    captchas here.
  *  - `seller`: real local/container IP, no proxy, no fingerprint. Solves captchas in place via
  *    2captcha and reloads — does NOT rotate.
  *
@@ -19,10 +23,13 @@ import { PlaywrightCrawler, type PlaywrightCrawlingContext } from '@crawlee/play
 import { Actor, log } from 'apify';
 import type { Page } from 'playwright';
 
+import { allowAssets, armAssetBlocking } from './assets.js';
 import { CHALLENGE_SELECTORS, classifyPage, TITLE_SELECTORS } from './detection.js';
 import { logEgressIp } from './ip.js';
+import { armPdpInterceptor, probeProductToken } from './productApi.js';
 import { captureAndSave, type CaptureOptions } from './screenshot.js';
 import { passCaptcha } from './sellerCaptcha.js';
+import { extractAliExpressItemId, normalizeAliExpressUrl } from './url.js';
 
 interface Input {
     startUrls?: { url: string }[];
@@ -32,6 +39,8 @@ interface Input {
     viewportWidth?: number;
     viewportHeight?: number;
     twoCaptchaApiKey?: string;
+    /** Local debugging only — set false to watch the browser drive the page. Defaults to true. */
+    headless?: boolean;
 }
 
 // --- Hard-coded operational config (intentionally NOT exposed as input) --------------------------
@@ -40,10 +49,23 @@ const PROXY_COUNTRY = 'US';
 const CURRENCY = 'USD';
 const LANGUAGE = 'en_US';
 const MAX_CONCURRENCY = 2;
-const MAX_REQUESTS_PER_CRAWL = 10;
-const MAX_REQUEST_RETRIES = 10;
-const HEADLESS = true;
+/** Hard cap on how many URLs a single run accepts (anything beyond this is dropped). */
+const MAX_URLS = 10;
 const WAIT_MS = 3_000;
+
+/**
+ * Product mode: how many times we run the handler for one URL before giving up on rotation. The
+ * LAST of these attempts is the one that captures whatever rendered, captcha or not (see
+ * `rotateOrCapture`). Crawlee runs a request `maxRequestRetries + 1` times, hence the -1.
+ */
+const MAX_ATTEMPTS_PER_URL = 20;
+const MAX_REQUEST_RETRIES = MAX_ATTEMPTS_PER_URL - 1;
+
+/**
+ * Seller mode keeps the old, smaller budget: it SOLVES captchas rather than rotating, and one
+ * attempt can spend minutes inside a 2captcha solve — 20 of those would run for hours.
+ */
+const SELLER_MAX_ATTEMPTS_PER_URL = 11;
 
 await Actor.init();
 
@@ -67,14 +89,31 @@ function normalizeUrl(raw: string): string {
 const input = ((await Actor.getInput<Input>()) ?? {}) as Input;
 const mode: 'product' | 'seller' = input.mode === 'seller' ? 'seller' : 'product';
 
-const startUrls = (input.startUrls ?? [])
-    .map((entry) => entry.url)
-    .filter(Boolean)
-    .map((url) => {
-        const clean = normalizeUrl(url);
-        if (clean !== url) log.info('Stripped tracking params from URL.', { from: url, to: clean });
-        return clean;
+// Product mode canonicalizes `/item/` URLs to `https://www.aliexpress.com/item/<id>.html` — the
+// locale subdomain (`vi.`, `de.`, `m.`, …) is itself a region signal that contradicts our proxy
+// country. Anything else (and every seller URL) just loses its tracking params.
+const allUrls = [
+    ...new Set(
+        (input.startUrls ?? [])
+            .map((entry) => entry.url)
+            .filter(Boolean)
+            .map((url) => {
+                const clean = (mode === 'product' ? normalizeAliExpressUrl(url) : null) ?? normalizeUrl(url);
+                if (clean !== url) log.info('Normalized URL.', { from: url, to: clean });
+                return clean;
+            }),
+    ),
+];
+// The URL count is capped HERE rather than via `maxRequestsPerCrawl`, which counts every handler
+// run — retries included — and so would silently eat the retry budget instead of limiting URLs.
+const startUrls = allUrls.slice(0, MAX_URLS);
+if (allUrls.length > startUrls.length) {
+    log.warning(`Too many URLs — capturing the first ${MAX_URLS} and dropping the rest.`, {
+        received: allUrls.length,
+        dropped: allUrls.length - startUrls.length,
     });
+}
+const HEADLESS = input.headless ?? true;
 const viewportWidth = input.viewportWidth ?? 1920;
 const viewportHeight = input.viewportHeight ?? 1080;
 const captureOptions: CaptureOptions = {
@@ -168,8 +207,17 @@ async function applyStealthInitScript(page: Page): Promise<void> {
     });
 }
 
-/** Retire the session (→ fresh sticky IP + fresh fingerprint on retry) and throw so Crawlee retries. */
+/**
+ * Per-run tally of how many times we rotated because of an anti-bot block, keyed by reason
+ * (`captcha`, `punish`, `pdp-blocked`, `empty-product`, …). Each entry counts one actual
+ * block-and-retry event — unlike Crawlee's `requestsRetries`, which counts +1 per request no matter
+ * how many times it was retried.
+ */
+const rotationStats: Record<string, number> = {};
+
+/** Retire the session (→ fresh IP + fresh fingerprint on retry) and throw so Crawlee retries. */
 function rotateAndRetry(ctx: PlaywrightCrawlingContext, reason: string): never {
+    rotationStats[reason] = (rotationStats[reason] ?? 0) + 1;
     ctx.log.warning('Block detected — rotating session/IP/fingerprint and retrying.', {
         reason,
         url: ctx.request.url,
@@ -180,23 +228,60 @@ function rotateAndRetry(ctx: PlaywrightCrawlingContext, reason: string): never {
     throw new Error(`Anti-bot block (${reason}); rotating to a fresh session/proxy.`);
 }
 
+/**
+ * True when Crawlee has no retries left for this request — the next throw would hand it straight to
+ * `failedRequestHandler`. Crawlee runs a request `maxRequestRetries + 1` times, with `retryCount`
+ * counting from 0, so the last pass is the one where `retryCount === MAX_REQUEST_RETRIES`.
+ */
+function isFinalAttempt(ctx: PlaywrightCrawlingContext): boolean {
+    return ctx.request.retryCount >= MAX_REQUEST_RETRIES;
+}
+
+/**
+ * Handle a detected block. Normally this rotates and never returns.
+ *
+ * On the FINAL attempt there is nothing left to rotate to — throwing would end the run with an empty
+ * dataset row and no image at all. So we log it, RETURN, and let the handler carry on to capture
+ * whatever rendered, captcha page included: a screenshot of the block is more useful to the caller
+ * than nothing, and it makes the failure visible rather than merely reported.
+ */
+function rotateOrCapture(ctx: PlaywrightCrawlingContext, reason: string): void {
+    if (!isFinalAttempt(ctx)) {
+        rotateAndRetry(ctx, reason);
+    }
+    rotationStats[`final-capture:${reason}`] = (rotationStats[`final-capture:${reason}`] ?? 0) + 1;
+    ctx.log.warning('Final attempt — no retries left; capturing the page as-is despite the block.', {
+        reason,
+        url: ctx.request.url,
+        retryCount: ctx.request.retryCount,
+    });
+}
+
 async function buildProductCrawler(): Promise<PlaywrightCrawler> {
+    // Apify DATACENTER proxy (default automatic pool — no groups). Datacenter is far lower-latency
+    // than residential, so each attempt is cheap; paired with the token probe below (which detects a
+    // burned session in seconds), we accept a higher block rate and lean on fast rotate-and-retry.
+    // Swap in `{ groups: ['RESIDENTIAL'], countryCode: PROXY_COUNTRY }` for the slower, cleaner path.
     const proxyConfiguration = await Actor.createProxyConfiguration({
-        groups: ['RESIDENTIAL'],
         countryCode: PROXY_COUNTRY,
     }); // do NOT pass checkAccess — local runs without proxy access must still run.
+    log.info(`Using Apify datacenter proxy (auto, country ${PROXY_COUNTRY}).`);
+
+    const localeCookieValue = `site=glo&c_tp=${CURRENCY}&region=${PROXY_COUNTRY}&b_locale=${LANGUAGE}&ae_u_p_s=2`;
 
     return new PlaywrightCrawler({
         proxyConfiguration,
         navigationTimeoutSecs: 45,
-        requestHandlerTimeoutSecs: 120,
+        requestHandlerTimeoutSecs: 180,
         minConcurrency: 1,
         maxConcurrency: MAX_CONCURRENCY,
-        maxRequestsPerCrawl: MAX_REQUESTS_PER_CRAWL,
+        // Sized off the retry budget: `maxRequestsPerCrawl` counts handler runs (retries included),
+        // so a flat number would cut rotation short before the final-attempt capture ever ran.
+        maxRequestsPerCrawl: startUrls.length * MAX_ATTEMPTS_PER_URL,
         maxRequestRetries: MAX_REQUEST_RETRIES,
         useSessionPool: true,
         persistCookiesPerSession: true,
-        retryOnBlocked: false,
+        retryOnBlocked: false, // we own block detection; Crawlee must not second-guess it mid-handler
         sessionPoolOptions: {
             maxPoolSize: Math.max(MAX_CONCURRENCY + 2, 4),
             sessionOptions: { maxUsageCount: 5, maxErrorScore: 1 }, // maxErrorScore:1 = drop a burned IP immediately
@@ -212,9 +297,24 @@ async function buildProductCrawler(): Promise<PlaywrightCrawler> {
         },
         preNavigationHooks: [
             async ({ page }, gotoOptions) => {
-                // eslint-disable-next-line no-param-reassign
-                if (gotoOptions) gotoOptions.waitUntil = 'domcontentloaded';
                 await page.setViewportSize({ width: viewportWidth, height: viewportHeight });
+                // AliExpress decides currency/locale from the `aep_usuc_f` cookie (and the proxy IP
+                // geo), not from the `_currency` field in the pdp payload. Pin it on BOTH domains we
+                // touch: `.com` for navigation, `.us` for the `acs` MTOP host.
+                await page.context().addCookies([
+                    { name: 'aep_usuc_f', value: localeCookieValue, domain: '.aliexpress.com', path: '/' },
+                    { name: 'intl_locale', value: LANGUAGE, domain: '.aliexpress.com', path: '/' },
+                    { name: 'aep_usuc_f', value: localeCookieValue, domain: '.aliexpress.us', path: '/' },
+                    { name: 'intl_locale', value: LANGUAGE, domain: '.aliexpress.us', path: '/' },
+                ]);
+                // Pass 1 exists only to bootstrap cookies, so drop the heavy subresources and resolve
+                // navigation at `commit` — the instant the document response (and its Set-Cookie
+                // headers) lands, WITHOUT waiting for the SPA to parse/execute. Both are lifted again
+                // for the render pass. Never `networkidle` (AliExpress holds connections open).
+                await armAssetBlocking(page);
+                armPdpInterceptor(page);
+                // eslint-disable-next-line no-param-reassign -- mutating gotoOptions is the documented Crawlee way to set navigation options.
+                if (gotoOptions) gotoOptions.waitUntil = 'commit';
                 await applyRegionOverrides(page);
                 await applyStealthInitScript(page);
             },
@@ -223,12 +323,64 @@ async function buildProductCrawler(): Promise<PlaywrightCrawler> {
         failedRequestHandler: pushFailure,
         requestHandler: async (ctx) => {
             const { page, request, log: ctxLog } = ctx;
+            // Set once we detect a block we can no longer rotate away from (final attempt). It both
+            // short-circuits the checks below and lands in the dataset row, so a last-resort capture
+            // is never mistaken for a clean one.
+            let blockedAs: string | null = null;
 
-            // 1. Classify on arrival. captcha/punish/blocked → burned session → rotate (never solve).
-            let status = await classifyPage(page);
-            if (status === 'captcha' || status === 'punish' || status === 'blocked') rotateAndRetry(ctx, status);
+            // 1. Hard block already visible on arrival → rotate immediately (never solve).
+            const arrival = await classifyPage(page);
+            if (arrival === 'captcha' || arrival === 'punish' || arrival === 'blocked') {
+                rotateOrCapture(ctx, arrival); // returns ONLY on the final attempt
+                blockedAs = arrival;
+            }
 
-            // 2. Race the product title against any challenge selector: AliExpress injects the
+            // 2. TOKEN GATE. Acquire the `_m_h5_tk` token and fetch the product payload with it. This
+            //    is the whole point of the two-pass flow: a burned session fails here in ~1-3s instead
+            //    of after a 30-45s render that ends in a slider captcha. Rotating is therefore cheap,
+            //    which is what makes the retry loop fast.
+            const productId = extractAliExpressItemId(request.url);
+            if (blockedAs) {
+                // Already known blocked and out of retries — the signed call would only spend seconds
+                // confirming what we can see. Go straight to rendering the block for the screenshot.
+                ctxLog.warning('Skipping the token gate — already blocked with no retries left.', { reason: blockedAs });
+            } else if (!productId) {
+                // Not a /item/ URL (mode mismatch) — nothing to gate on; render it as-is.
+                ctxLog.warning('No product id in URL — skipping the token gate.', { url: request.url });
+            } else {
+                const probe = await probeProductToken(page, productId, ctxLog);
+                if (probe.ok) {
+                    ctxLog.info('Token valid — session trusted, rendering the page for capture.', {
+                        productId,
+                        title: probe.title,
+                    });
+                } else {
+                    // `pdp-blocked` may actually be a captcha/punish overlay — reclassify for an
+                    // accurate tally ('ok' with no JSON means the signed call timed out, not a block).
+                    let reason = probe.reason ?? 'pdp-blocked';
+                    if (reason === 'pdp-blocked') {
+                        const status = await classifyPage(page);
+                        reason = status === 'ok' ? 'pdp-timeout' : status;
+                    }
+                    rotateOrCapture(ctx, reason);
+                    blockedAs = reason;
+                }
+            }
+
+            await logEgressIp(page, ctxLog, 'product'); // expect a proxy IP here
+
+            // 3. RENDER PASS. The token proved the session is trusted, so now pay for a real render:
+            //    unblock images/fonts/CSS (the screenshot needs them) and reload the page properly.
+            //    On a final-attempt capture we reload too — pass 1 stopped at `commit` with assets
+            //    blocked, so without it the "screenshot" would be a half-styled shell.
+            allowAssets(page);
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: 45_000 }).catch((error: unknown) => {
+                ctxLog.warning('Render-pass reload failed — capturing whatever is on the page.', {
+                    error: error instanceof Error ? error.message : String(error),
+                });
+            });
+
+            // 4. Race the product title against any challenge selector: AliExpress injects the
             //    slider/reCAPTCHA a few seconds AFTER domcontentloaded, so blindly waiting out the
             //    title timeout would burn ~30s per challenged page. Whichever appears first wins.
             await Promise.race([
@@ -236,23 +388,17 @@ async function buildProductCrawler(): Promise<PlaywrightCrawler> {
                 page.waitForSelector(CHALLENGE_SELECTORS.join(', '), { timeout: 30_000 }).catch(() => null),
             ]);
 
-            // 3. Re-classify immediately and rotate on any block BEFORE spending time on the hydration
-            //    settle below — no point waiting on a page we're about to discard.
-            status = await classifyPage(page);
-            if (status === 'captcha' || status === 'punish' || status === 'blocked') rotateAndRetry(ctx, status);
-
-            // 4. Short hydration settle (never networkidle).
+            // 5. Short hydration settle (never networkidle), then a final classify — a late challenge
+            //    can still appear after hydration, and `empty` after a full load is a soft block.
             await page.waitForTimeout(1_500 + Math.random() * 1_500);
-
-            // 5. A late challenge can still appear AFTER hydration — final re-classify before trusting
-            //    the page. `empty` after a full load is a soft block; rotate it like a hard one.
-            status = await classifyPage(page);
-            if (status !== 'ok') rotateAndRetry(ctx, status);
-
-            await logEgressIp(page, ctxLog, 'product'); // expect a proxy IP here
+            const rendered = await classifyPage(page);
+            if (rendered !== 'ok') {
+                rotateOrCapture(ctx, `render-${rendered}`); // returns ONLY on the final attempt
+                blockedAs = `render-${rendered}`;
+            }
 
             // 6. Lazy-load scroll (if fullPage) → waitMs → screenshot → KV save → pushData.
-            await captureAndSave(page, request.url, captureOptions, ctxLog);
+            await captureAndSave(page, request.url, captureOptions, ctxLog, blockedAs ? { blocked: blockedAs } : undefined);
         },
     });
 }
@@ -290,8 +436,8 @@ async function buildSellerCrawler(): Promise<PlaywrightCrawler> {
         navigationTimeoutSecs: 90,
         requestHandlerTimeoutSecs: 360, // a 2captcha solve can take 1-3 min
         maxConcurrency: 1,
-        maxRequestsPerCrawl: MAX_REQUESTS_PER_CRAWL,
-        maxRequestRetries: MAX_REQUEST_RETRIES,
+        maxRequestsPerCrawl: startUrls.length * SELLER_MAX_ATTEMPTS_PER_URL,
+        maxRequestRetries: SELLER_MAX_ATTEMPTS_PER_URL - 1,
         browserPoolOptions: { useFingerprints: false }, // NO fingerprint
         launchContext: {
             useChrome: true,
@@ -356,6 +502,13 @@ if (startUrls.length === 0) {
     log.info(`Starting AliExpress screenshot Actor in "${mode}" mode.`, { urls: startUrls.length });
     const crawler = mode === 'seller' ? await buildSellerCrawler() : await buildProductCrawler();
     await crawler.run(startUrls);
+
+    // How aggressively AliExpress blocked us, broken down by reason. 0 across the board means every
+    // URL passed the token gate and rendered on the first attempt.
+    if (mode === 'product') {
+        const totalBlockRetries = Object.values(rotationStats).reduce((sum, n) => sum + n, 0);
+        log.info(`Block rotations: ${totalBlockRetries}`, { byReason: rotationStats });
+    }
 }
 
 await Actor.exit();

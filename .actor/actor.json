@@ -7,7 +7,7 @@
 	"version": "0.1",
 	"meta": {
 		"templateId": "ts-crawlee-playwright-chrome",
-		"generatedBy": "Claude Code with Claude Opus 4.8"
+		"generatedBy": "Claude Code with Claude Opus 5"
 	},
 	"input": "./input_schema.json",
 	"output": "./output_schema.json",

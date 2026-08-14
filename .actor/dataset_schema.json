@@ -6,7 +6,7 @@
         "overview": {
             "title": "Overview",
             "transformation": {
-                "fields": ["url", "screenshotUrl", "error"]
+                "fields": ["url", "screenshotUrl", "blocked", "error"]
             },
             "display": {
                 "component": "table",
@@ -18,6 +18,10 @@
                     "screenshotUrl": {
                         "label": "Screenshot",
                         "format": "image"
+                    },
+                    "blocked": {
+                        "label": "Blocked",
+                        "format": "text"
                     },
                     "error": {
                         "label": "Error",

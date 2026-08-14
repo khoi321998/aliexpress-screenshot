@@ -57,8 +57,18 @@ async function lazyLoadScroll(page: Page, settleMs = 2_500): Promise<void> {
  * Capture a screenshot, store it in the default key-value store, and push
  * `{ url, screenshotUrl }` to the dataset. `screenshotUrl` is a signed public KV URL
  * with `disableRedirect=true` so it resolves directly to the PNG/JPEG.
+ *
+ * `extra` is merged into the pushed record — the product flow uses it to stamp `blocked` on a
+ * last-resort capture (final attempt, page still behind a challenge) so it is never mistaken for a
+ * clean one.
  */
-export async function captureAndSave(page: Page, url: string, opts: CaptureOptions, log: Logger): Promise<void> {
+export async function captureAndSave(
+    page: Page,
+    url: string,
+    opts: CaptureOptions,
+    log: Logger,
+    extra?: Record<string, unknown>,
+): Promise<void> {
     if (opts.fullPage) {
         await lazyLoadScroll(page);
     }
@@ -80,7 +90,7 @@ export async function captureAndSave(page: Page, url: string, opts: CaptureOptio
     const publicUrl = store.getPublicUrl(key);
     const screenshotUrl = `${publicUrl}${publicUrl.includes('?') ? '&' : '?'}disableRedirect=true`;
 
-    log.info('Screenshot captured.', { url, key });
+    log.info('Screenshot captured.', { url, key, ...extra });
     log.info(`Screenshot URL: ${screenshotUrl}`);
-    await Actor.pushData({ url, screenshotUrl });
+    await Actor.pushData({ url, screenshotUrl, ...extra });
 }
