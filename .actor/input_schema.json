@@ -18,10 +18,22 @@
             "default": "product",
             "enum": ["product", "seller"],
             "enumTitles": [
-                "Product (US datacenter proxy + fingerprint, MTOP token gate, fast rotate on block)",
+                "Product (per-country proxy + fingerprint, MTOP token gate, fast rotate on block)",
                 "Seller (real IP, no fingerprint, solve captcha via 2captcha)"
             ],
             "description": "Which browser strategy to use. Product mode validates the session with the signed MTOP token before rendering, so blocked sessions rotate in seconds; seller mode solves captchas in place via 2captcha."
+        },
+        "shipToCountry": {
+            "title": "Ship-to Country",
+            "type": "string",
+            "editor": "textfield",
+            "description": "Product mode only. Force one ship-to country (ISO-3166 alpha-2, e.g. ES, DE, VN) for every URL. Leave empty to auto-detect it per URL from the locale subdomain (es./de./vi.) or the gatewayAdapt stamp. The detected country drives the storefront host, the proxy exit country, the browser timezone, the region cookie and the signed product API call together — mixing them is what triggers captchas."
+        },
+        "residentialProxy": {
+            "title": "Residential Proxy Everywhere",
+            "type": "boolean",
+            "default": false,
+            "description": "Product mode only. Force the RESIDENTIAL proxy group for every country. Non-US ship-to already uses residential automatically (the datacenter pool holds US IPs only); US uses the cheaper, faster datacenter pool unless this is on."
         },
         "format": {
             "title": "Screenshot Format",

@@ -26,14 +26,44 @@ import { createHash, randomBytes } from 'node:crypto';
 import type { Page } from 'playwright';
 
 import type { Logger } from './logger.js';
+import { storefrontHost } from './url.js';
 
 /** The MTOP API that returns the full PC product payload. */
 const PDP_QUERY_RE = /mtop\.aliexpress\.pdp\.pc\.query/i;
 const PDP_API = 'mtop.aliexpress.pdp.pc.query';
 /** Per-API H5 appKey used by the PC product endpoint. */
 const PDP_APP_KEY = '12574478';
-/** MTOP H5 endpoint base on the US gateway (matches the `.us` PDP the page redirects to). */
-const ACS_BASE = 'https://acs.aliexpress.us/h5';
+
+/** Which MTOP gateway (and the site identity that goes with it) a given ship-to must be asked on. */
+interface Gateway {
+    /** MTOP H5 endpoint base. */
+    acsBase: string;
+    /** Site origin the signed call claims to come from (referer/origin headers). */
+    origin: string;
+    /** `ext.site` in the pdp payload — AliExpress's own name for the storefront. */
+    site: string;
+    /** `ext.host` in the pdp payload. */
+    host: string;
+}
+
+/**
+ * Pick the gateway for a ship-to country.
+ *
+ * aliexpress.us is a legally separate US storefront with its own catalogue, and `acs.aliexpress.us`
+ * only answers for it — asking it about a listing that is only on the global site is exactly the
+ * "403 from Spain" symptom. So US keeps the `.us` gateway it has always used (that path works and we
+ * don't want to disturb it), and every other ship-to goes to the global `.com` gateway, which is the
+ * only one that serves non-US regions.
+ */
+function gatewayFor(shipToCountry: string): Gateway {
+    if (shipToCountry.toUpperCase() === 'US') {
+        return { acsBase: 'https://acs.aliexpress.us/h5', origin: 'https://www.aliexpress.us', site: 'usa', host: 'www.aliexpress.us' };
+    }
+    // Claim the same storefront the crawler actually navigated to (`es.aliexpress.com`, ...), so the
+    // referer and `ext.host` match the page the signed call is supposed to be coming from.
+    const host = storefrontHost(shipToCountry);
+    return { acsBase: 'https://acs.aliexpress.com/h5', origin: `https://${host}`, site: 'glo', host };
+}
 
 /** Per-page holder for the intercepted pdp.pc.query JSON, resolved by the response listener. */
 interface PdpWaiter {
@@ -114,28 +144,34 @@ function md5(input: string): string {
     return createHash('md5').update(input).digest('hex');
 }
 
-/** Read the MTOP token (part of `_m_h5_tk` before the `_`) from the context cookie jar. */
-async function readMtopToken(page: Page): Promise<string> {
-    const cookies = await page.context().cookies(ACS_BASE).catch(() => []);
+/** Read the MTOP token (part of `_m_h5_tk` before the `_`) from the gateway's cookie jar. */
+async function readMtopToken(page: Page, acsBase: string): Promise<string> {
+    const cookies = await page.context().cookies(acsBase).catch(() => []);
     const tk = cookies.find((c) => c.name === '_m_h5_tk');
     return tk ? tk.value.split('_')[0] : '';
 }
 
-/** Build the `data` payload the PC page sends for pdp.pc.query (locale/region inline, not cookie). */
-function buildPdpData(productId: string | number): string {
+/**
+ * Build the `data` payload the PC page sends for pdp.pc.query (locale/region inline, not cookie).
+ *
+ * `country` is the ship-to and it decides whether the listing resolves at all: a seller who does not
+ * ship to the requested country answers with an empty `result`, which the caller cannot distinguish
+ * from an anti-bot block. It must agree with the `region` in the page's `aep_usuc_f` cookie.
+ */
+function buildPdpData(productId: string | number, shipToCountry: string, gateway: Gateway): string {
     const ext = JSON.stringify({
         foreverRandomToken: randomBytes(16).toString('hex'),
-        site: 'usa',
+        site: gateway.site,
         crawler: false,
         'x-m-biz-bx-region': '',
         signedIn: false,
-        host: 'www.aliexpress.us',
+        host: gateway.host,
     });
     return JSON.stringify({
         productId: String(productId),
         _lang: 'en_US',
         _currency: 'USD',
-        country: 'US',
+        country: shipToCountry,
         province: '',
         city: '',
         channel: '',
@@ -155,9 +191,9 @@ function buildPdpData(productId: string | number): string {
  * re-sign with it (this is the "retry immediately" behaviour). Returns the parsed response object,
  * or `null` on a non-JSON body (a block) / transport failure.
  */
-async function callMtopRequest(page: Page, api: string, data: string, log: Logger): Promise<Record<string, unknown> | null> {
+async function callMtopRequest(page: Page, api: string, data: string, log: Logger, gateway: Gateway): Promise<Record<string, unknown> | null> {
     for (let attempt = 1; attempt <= 3; attempt += 1) {
-        const token = await readMtopToken(page);
+        const token = await readMtopToken(page, gateway.acsBase);
         const t = Date.now().toString();
         const sign = md5(`${token}&${t}&${PDP_APP_KEY}&${data}`);
         const params = new URLSearchParams({
@@ -172,13 +208,13 @@ async function callMtopRequest(page: Page, api: string, data: string, log: Logge
             callback: 'mtopjsonp',
             data,
         });
-        const url = `${ACS_BASE}/${api}/1.0/?${params.toString()}`;
+        const url = `${gateway.acsBase}/${api}/1.0/?${params.toString()}`;
 
         let body: string;
         try {
             const res = await page.request.get(url, {
                 timeout: 15_000,
-                headers: { referer: 'https://www.aliexpress.us/', origin: 'https://www.aliexpress.us' },
+                headers: { referer: `${gateway.origin}/`, origin: gateway.origin },
             });
             body = await res.text();
         } catch (error) {
@@ -210,8 +246,9 @@ async function callMtopRequest(page: Page, api: string, data: string, log: Logge
  * module map, or `null` when blocked (e.g. `FAIL_SYS_USER_VALIDATE`) so the caller rotates to a
  * fresh session.
  */
-async function fetchPdpDirect(page: Page, productId: string | number, log: Logger): Promise<Record<string, unknown> | null> {
-    const json = await callMtopRequest(page, PDP_API, buildPdpData(productId), log);
+async function fetchPdpDirect(page: Page, productId: string | number, log: Logger, shipToCountry: string): Promise<Record<string, unknown> | null> {
+    const gateway = gatewayFor(shipToCountry);
+    const json = await callMtopRequest(page, PDP_API, buildPdpData(productId, shipToCountry, gateway), log, gateway);
     if (!json) {
         return null;
     }
@@ -220,7 +257,12 @@ async function fetchPdpDirect(page: Page, productId: string | number, log: Logge
         return result;
     }
     const { ret } = json as { ret?: unknown[] };
-    log.warning('pdp.pc.query — no result (block).', { ret: Array.isArray(ret) ? String(ret[0]) : null });
+    // An empty result here is ambiguous: an anti-bot block OR a listing the seller simply won't ship
+    // to `shipToCountry`. Log the region so the second case is diagnosable from the run log.
+    log.warning('pdp.pc.query — no result (block or unavailable for ship-to).', {
+        ret: Array.isArray(ret) ? String(ret[0]) : null,
+        shipToCountry,
+    });
     return null;
 }
 
@@ -248,8 +290,8 @@ export interface TokenProbe {
  * Anything else is a burned session — the caller rotates instead of rendering a page that would
  * only show a captcha.
  */
-export async function probeProductToken(page: Page, productId: string, log: Logger): Promise<TokenProbe> {
-    let result = await fetchPdpDirect(page, productId, log);
+export async function probeProductToken(page: Page, productId: string, log: Logger, shipToCountry = 'US'): Promise<TokenProbe> {
+    let result = await fetchPdpDirect(page, productId, log, shipToCountry);
     if (!result) {
         result = await waitForPdpResult(page, 8_000);
         if (result) {
