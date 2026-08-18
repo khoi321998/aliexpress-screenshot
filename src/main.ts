@@ -31,6 +31,14 @@ import { captureAndSave, type CaptureOptions } from './screenshot.js';
 import { passCaptcha } from './sellerCaptcha.js';
 import { extractAliExpressItemId, normalizeAliExpressUrl } from './url.js';
 
+// Load a local `.env` (e.g. TWOCAPTCHA_API_KEY) for local runs. On the Apify platform these
+// come from the Actor's environment variables, so a missing file is fine — ignore the error.
+try {
+    process.loadEnvFile();
+} catch {
+    // No local .env present (e.g. running on the Apify platform); rely on real env vars.
+}
+
 interface Input {
     startUrls?: { url: string }[];
     mode?: 'product' | 'seller';
@@ -38,10 +46,20 @@ interface Input {
     fullPage?: boolean;
     viewportWidth?: number;
     viewportHeight?: number;
+    /** Full-page mode only. How many viewport-heights deep to capture; 0 disables the cap. */
+    maxCaptureScreens?: number;
     twoCaptchaApiKey?: string;
     /** Local debugging only — set false to watch the browser drive the page. Defaults to true. */
     headless?: boolean;
 }
+
+/**
+ * How deep a full-page capture goes by default, counted in viewport-heights ("screens") and
+ * converted to pixels below. AliExpress `/store/` pages lazy-load products forever, so
+ * `scrollHeight` grows about as fast as we scroll: an uncapped full-page capture never reaches the
+ * bottom and the run burns its timeout. Overridable per run via `maxCaptureScreens`.
+ */
+const DEFAULT_MAX_CAPTURE_SCREENS = 3;
 
 // --- Hard-coded operational config (intentionally NOT exposed as input) --------------------------
 // These are fixed in code rather than passed via input. To change one, edit it here.
@@ -116,10 +134,12 @@ if (allUrls.length > startUrls.length) {
 const HEADLESS = input.headless ?? true;
 const viewportWidth = input.viewportWidth ?? 1920;
 const viewportHeight = input.viewportHeight ?? 1080;
+const maxCaptureScreens = Math.max(0, input.maxCaptureScreens ?? DEFAULT_MAX_CAPTURE_SCREENS);
 const captureOptions: CaptureOptions = {
     fullPage: input.fullPage ?? true,
     format: input.format === 'jpeg' ? 'jpeg' : 'png',
     waitMs: WAIT_MS,
+    maxHeight: maxCaptureScreens * viewportHeight,
 };
 
 // Terminate quickly when aborted to honour any cost limits (PPU/PPE+U billing).
@@ -499,7 +519,13 @@ async function buildSellerCrawler(): Promise<PlaywrightCrawler> {
 if (startUrls.length === 0) {
     log.warning('No startUrls provided — nothing to capture.');
 } else {
-    log.info(`Starting AliExpress screenshot Actor in "${mode}" mode.`, { urls: startUrls.length });
+    log.info(`Starting AliExpress screenshot Actor in "${mode}" mode.`, {
+        urls: startUrls.length,
+        // Only meaningful in full-page mode; `0` means the capture runs to the bottom of the page.
+        ...(captureOptions.fullPage
+            ? { captureScreens: maxCaptureScreens, captureHeightPx: captureOptions.maxHeight }
+            : {}),
+    });
     const crawler = mode === 'seller' ? await buildSellerCrawler() : await buildProductCrawler();
     await crawler.run(startUrls);
 

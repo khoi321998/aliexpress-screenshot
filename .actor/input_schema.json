@@ -38,6 +38,15 @@
             "default": true,
             "description": "Capture the entire scrollable page (lazy-loads images first) instead of just the viewport."
         },
+        "maxCaptureScreens": {
+            "title": "Max Capture Depth",
+            "type": "integer",
+            "default": 3,
+            "minimum": 0,
+            "maximum": 20,
+            "unit": "screens",
+            "description": "Full-page mode only. How deep to scroll and capture, counted in viewport-heights — 3 screens at the default 1080px viewport is 3240px of page. Seller (/store/) pages lazy-load products endlessly, so without a cap the scroll never reaches the bottom and the run hits its timeout. Set 0 for no cap — only safe on product (/item/) pages, which are finite."
+        },
         "viewportWidth": {
             "title": "Viewport Width",
             "type": "integer",

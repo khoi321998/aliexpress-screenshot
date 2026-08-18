@@ -11,3 +11,6 @@ storage
 
 # Added by Apify CLI
 .venv
+
+# Local environment / secrets
+.env
