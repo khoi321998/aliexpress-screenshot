@@ -90,12 +90,12 @@ const WAIT_MS = 3_000;
  * LAST of these attempts is the one that captures whatever rendered, captcha or not (see
  * `rotateOrCapture`). Crawlee runs a request `maxRequestRetries + 1` times, hence the -1.
  */
-const MAX_ATTEMPTS_PER_URL = 20;
+const MAX_ATTEMPTS_PER_URL = 15;
 const MAX_REQUEST_RETRIES = MAX_ATTEMPTS_PER_URL - 1;
 
 /**
  * Seller mode keeps the old, smaller budget: it SOLVES captchas rather than rotating, and one
- * attempt can spend minutes inside a 2captcha solve — 20 of those would run for hours.
+ * attempt can spend minutes inside a 2captcha solve — 15 of those would run for hours.
  */
 const SELLER_MAX_ATTEMPTS_PER_URL = 11;
 
